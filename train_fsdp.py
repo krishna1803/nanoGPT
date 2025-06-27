@@ -1,18 +1,18 @@
 """
-This training script can be run both on a single gpu in debug mode,
-and also in a larger training run with distributed data parallel (ddp).
+This training script uses PyTorch's Fully Sharded Data Parallel (FSDP) for efficient training
+of large language models across multiple GPUs and nodes.
 
 To run on a single GPU, example:
-$ python train.py --batch_size=32 --compile=False
+$ python train_fsdp.py --batch_size=32 --compile=False
 
-To run with DDP on 4 gpus on 1 node, example:
-$ torchrun --standalone --nproc_per_node=4 train.py
+To run with FSDP on 4 gpus on 1 node, example:
+$ torchrun --standalone --nproc_per_node=4 train_fsdp.py
 
-To run with DDP on 4 gpus across 2 nodes, example:
+To run with FSDP on 4 gpus across 2 nodes, example:
 - Run on the first (master) node with example IP 123.456.123.456:
-$ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=0 --master_addr=123.456.123.456 --master_port=1234 train.py
+$ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=0 --master_addr=123.456.123.456 --master_port=1234 train_fsdp.py
 - Run on the worker node:
-$ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123.456 --master_port=1234 train.py
+$ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123.456 --master_port=1234 train_fsdp.py
 (If your cluster does not have Infiniband interconnect prepend NCCL_IB_DISABLE=1)
 """
 
@@ -24,8 +24,22 @@ from contextlib import nullcontext
 
 import numpy as np
 import torch
-from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
+
+# Import FSDP related modules
+from torch.distributed.fsdp import (
+    FullyShardedDataParallel as FSDP,
+    MixedPrecision,
+    BackwardPrefetch,
+    ShardingStrategy,
+    CPUOffload
+)
+from torch.distributed.fsdp.wrap import (
+    transformer_auto_wrap_policy,
+    size_based_auto_wrap_policy,
+    enable_wrap,
+    wrap
+)
 
 from model import GPTConfig, GPT
 
@@ -45,7 +59,7 @@ wandb_project = 'owt'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
 # data
 dataset = 'openwebtext'
-gradient_accumulation_steps = 4 * 8 # used to simulate larger batch sizes
+gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
 batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
 # model
@@ -66,8 +80,14 @@ decay_lr = True # whether to decay the learning rate
 warmup_iters = 2000 # how many steps to warm up for
 lr_decay_iters = 600000 # should be ~= max_iters per Chinchilla
 min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
-# DDP settings
+# DDP/FSDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
+# FSDP specific settings
+sharding_strategy = 'FULL_SHARD' # 'FULL_SHARD', 'SHARD_GRAD_OP', or 'NO_SHARD'
+min_params_for_wrap = 1e6 # parameters in module must be >= this value to be wrapped separately
+cpu_offload = False # whether to offload parameters to CPU
+backward_prefetch = 'BACKWARD_PRE' # 'BACKWARD_PRE', 'BACKWARD_POST', or None
+activation_checkpointing = False # whether to use activation checkpointing
 # system
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
@@ -79,8 +99,8 @@ config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
 
 # various inits, derived attributes, I/O setup
-ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
-if ddp:
+is_distributed = int(os.environ.get('RANK', -1)) != -1 # is this a distributed run?
+if is_distributed:
     init_process_group(backend=backend)
     ddp_rank = int(os.environ['RANK'])
     ddp_local_rank = int(os.environ['LOCAL_RANK'])
@@ -94,7 +114,7 @@ if ddp:
     assert gradient_accumulation_steps % ddp_world_size == 0
     gradient_accumulation_steps //= ddp_world_size
 else:
-    # if not ddp, we are running on a single gpu, and one process
+    # if not distributed, we are running on a single gpu, and one process
     master_process = True
     seed_offset = 0
     ddp_world_size = 1
@@ -110,6 +130,41 @@ device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.aut
 # note: float16 data type will automatically use a GradScaler
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
+
+# FSDP mixed precision setup
+if dtype == 'float16':
+    mixed_precision_policy = MixedPrecision(
+        param_dtype=torch.float16,
+        reduce_dtype=torch.float16,
+        buffer_dtype=torch.float16,
+    )
+elif dtype == 'bfloat16':
+    mixed_precision_policy = MixedPrecision(
+        param_dtype=torch.bfloat16,
+        reduce_dtype=torch.bfloat16,
+        buffer_dtype=torch.bfloat16,
+    )
+else:  # float32
+    mixed_precision_policy = None
+
+# Map sharding strategy string to enum
+sharding_strategy_map = {
+    'FULL_SHARD': ShardingStrategy.FULL_SHARD,
+    'SHARD_GRAD_OP': ShardingStrategy.SHARD_GRAD_OP,
+    'NO_SHARD': ShardingStrategy.NO_SHARD,
+}
+chosen_sharding_strategy = sharding_strategy_map[sharding_strategy]
+
+# Map backward prefetch string to enum
+backward_prefetch_map = {
+    'BACKWARD_PRE': BackwardPrefetch.BACKWARD_PRE,
+    'BACKWARD_POST': BackwardPrefetch.BACKWARD_POST,
+    None: None,
+}
+chosen_backward_prefetch = backward_prefetch_map[backward_prefetch]
+
+# CPU Offloading configuration
+cpu_offload_config = CPUOffload(offload_params=cpu_offload) if cpu_offload else None
 
 # poor man's data loader
 data_dir = os.path.join('data', dataset)
@@ -192,24 +247,58 @@ if block_size < model.config.block_size:
     model_args['block_size'] = block_size # so that the checkpoint will have the right value
 model.to(device)
 
+# Apply activation checkpointing if enabled
+if activation_checkpointing and is_distributed:
+    # Define which modules to apply activation checkpointing to
+    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+        checkpoint_wrapper,
+        apply_activation_checkpointing
+    )
+    from model import Block  # Import your transformer block class
+    check_fn = lambda submodule: isinstance(submodule, Block)
+    apply_activation_checkpointing(model, checkpoint_wrapper_fn=checkpoint_wrapper, 
+                               check_fn=check_fn)
+
 # initialize a GradScaler. If enabled=False scaler is a no-op
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
 
-# optimizer
-optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
-if init_from == 'resume':
-    optimizer.load_state_dict(checkpoint['optimizer'])
-checkpoint = None # free up memory
+# Define FSDP auto wrap policy
+def get_auto_wrap_policy():
+    # For transformer models, use transformer_auto_wrap_policy with the transformer block
+    from model import Block  # Import your transformer block class
+    return transformer_auto_wrap_policy(
+        transformer_layer_cls={Block},
+    )
+    # Alternative: Size-based policy
+    # return size_based_auto_wrap_policy(min_num_params=min_params_for_wrap)
 
-# compile the model
-if compile:
+# compile the model first if needed
+if compile and not is_distributed:  # Don't compile when using FSDP
     print("compiling the model... (takes a ~minute)")
     unoptimized_model = model
     model = torch.compile(model) # requires PyTorch 2.0
 
-# wrap model into DDP container
-if ddp:
-    model = DDP(model, device_ids=[ddp_local_rank])
+# wrap model into FSDP container instead of DDP
+if is_distributed:
+    # Use FSDP instead of DDP
+    model = FSDP(
+        model,
+        auto_wrap_policy=get_auto_wrap_policy(),
+        mixed_precision=mixed_precision_policy,
+        sharding_strategy=chosen_sharding_strategy,
+        cpu_offload=cpu_offload_config,
+        backward_prefetch=chosen_backward_prefetch,
+        device_id=ddp_local_rank,
+    )
+    # FSDP models need to create optimizer after wrapping
+    optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
+else:
+    # Not distributed - create optimizer normally
+    optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
+
+if init_from == 'resume' and not is_distributed:
+    optimizer.load_state_dict(checkpoint['optimizer'])
+checkpoint = None # free up memory
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
@@ -243,6 +332,7 @@ def get_lr(it):
 
 # WanDB logging
 if wandb_log:
+    import wandb
     
     # Create a container for the run ID that can be broadcast
     run_id = [""]  # Using a list as a mutable container
@@ -252,7 +342,7 @@ if wandb_log:
         run = wandb.init(
             project=wandb_project,
             settings=wandb.Settings(
-                x_label=f"rank_ddp{ddp_local_rank}",
+                x_label=f"rank_fsdp{ddp_local_rank}",
                 mode="shared",
                 x_primary=True
             )
@@ -260,7 +350,7 @@ if wandb_log:
         run_id[0] = run.id
         
     # Synchronize all processes - wait for master to create the run
-    if ddp:
+    if is_distributed:
         torch.distributed.barrier()
         
         # Broadcast run_id from rank 0 to all other ranks
@@ -286,16 +376,58 @@ if wandb_log:
             settings=wandb.Settings(
                 mode="shared",
                 x_primary=False,
-                x_label=f"rank_ddp{ddp_local_rank}"
+                x_label=f"rank_fsdp{ddp_local_rank}"
             )
         )
+
+# Helper functions for FSDP checkpointing
+def save_fsdp_model(model, optimizer, filepath, iter_num, best_val_loss, config, model_args):
+    """Save FSDP model checkpoint"""
+    if master_process:
+        print(f"Saving FSDP model checkpoint to {filepath}")
     
+    # Save model using FSDP state_dict functionality
+    from torch.distributed.fsdp import (
+        FullStateDictConfig,
+        StateDictType,
+        FullOptimStateDictConfig,
+    )
+    
+    if master_process:
+        # For saving full state dict only on master process
+        full_state_dict_config = FullStateDictConfig(
+            offload_to_cpu=True, rank0_only=True
+        )
+        optim_state_dict_config = FullOptimStateDictConfig(
+            offload_to_cpu=True, rank0_only=True
+        )
+        
+        with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, full_state_dict_config):
+            model_state = model.state_dict()
+            
+        with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, optim_state_dict_config):
+            optim_state = FSDP.optim_state_dict(model, optimizer)
+        
+        checkpoint = {
+            'model': model_state,
+            'optimizer': optim_state,
+            'model_args': model_args,
+            'iter_num': iter_num,
+            'best_val_loss': best_val_loss,
+            'config': config,
+        }
+        
+        torch.save(checkpoint, filepath)
+    
+    # Make sure all processes wait for master to save
+    if is_distributed:
+        torch.distributed.barrier()
 
 # training loop
 X, Y = get_batch('train') # fetch the very first batch
 t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
-raw_model = model.module if ddp else model # unwrap DDP container if needed
+raw_model = model.module if is_distributed else model # unwrap FSDP container if needed
 running_mfu = -1.0
 while True:
 
@@ -319,28 +451,31 @@ while True:
         if losses['val'] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses['val']
             if iter_num > 0:
-                checkpoint = {
-                    'model': raw_model.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'model_args': model_args,
-                    'iter_num': iter_num,
-                    'best_val_loss': best_val_loss,
-                    'config': config,
-                }
-                print(f"saving checkpoint to {out_dir}")
-                torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+                if is_distributed:
+                    save_fsdp_model(
+                        model, optimizer, 
+                        os.path.join(out_dir, 'ckpt.pt'),
+                        iter_num, best_val_loss, config, model_args
+                    )
+                else:
+                    # Regular checkpoint saving for non-FSDP training
+                    checkpoint = {
+                        'model': raw_model.state_dict(),
+                        'optimizer': optimizer.state_dict(),
+                        'model_args': model_args,
+                        'iter_num': iter_num,
+                        'best_val_loss': best_val_loss,
+                        'config': config,
+                    }
+                    print(f"saving checkpoint to {out_dir}")
+                    torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
     if iter_num == 0 and eval_only:
         break
 
     # forward backward update, with optional gradient accumulation to simulate larger batch size
     # and using the GradScaler if data type is float16
     for micro_step in range(gradient_accumulation_steps):
-        if ddp:
-            # in DDP training we only need to sync gradients at the last micro step.
-            # the official way to do this is with model.no_sync() context manager, but
-            # I really dislike that this bloats the code and forces us to repeat code
-            # looking at the source of that context manager, it just toggles this variable
-            model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
+        # Note: FSDP doesn't need no_sync context like DDP does
         with ctx:
             logits, loss = model(X, Y)
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
@@ -377,5 +512,5 @@ while True:
     if iter_num > max_iters:
         break
 
-if ddp:
+if is_distributed:
     destroy_process_group()
