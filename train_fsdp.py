@@ -21,6 +21,7 @@ import time
 import math
 import pickle
 from contextlib import nullcontext
+import functools
 
 import numpy as np
 import torch
@@ -46,20 +47,20 @@ from model import GPTConfig, GPT
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
-out_dir = 'out'
-eval_interval = 2000
+out_dir = 'out-fsdp'
+eval_interval = 1000
 log_interval = 1
 eval_iters = 200
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
-wandb_log = False # disabled by default
-wandb_project = 'owt'
-wandb_run_name = 'gpt2' # 'run' + str(time.time())
+wandb_log = True # disabled by default
+wandb_project = 'nanogpt-fsdp'
+wandb_run_name = 'gpt2-fsdp' # 'run' + str(time.time())
 # data
 dataset = 'openwebtext'
-gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
+gradient_accumulation_steps = 4 * 8 # used to simulate larger batch sizes
 batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
 # model
@@ -70,7 +71,7 @@ dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
-max_iters = 600000 # total number of training iterations
+max_iters = 6000 # total number of training iterations
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
@@ -78,7 +79,7 @@ grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
 # learning rate decay settings
 decay_lr = True # whether to decay the learning rate
 warmup_iters = 2000 # how many steps to warm up for
-lr_decay_iters = 600000 # should be ~= max_iters per Chinchilla
+lr_decay_iters = 6000 # should be ~= max_iters per Chinchilla
 min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
 # DDP/FSDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
@@ -266,9 +267,20 @@ scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
 def get_auto_wrap_policy():
     # For transformer models, use transformer_auto_wrap_policy with the transformer block
     from model import Block  # Import your transformer block class
-    return transformer_auto_wrap_policy(
+    
+    # Use functools.partial to create a policy function with the required parameters
+    return functools.partial(
+        transformer_auto_wrap_policy,
         transformer_layer_cls={Block},
+        # These are required parameters for the function
+        #min_num_params=min_params_for_wrap
     )
+    
+    # Alternative: Custom policy function matching expected signature
+    # def custom_policy(module, recurse, nonwrapped_numel):
+    #     return isinstance(module, Block)
+    # return custom_policy
+    
     # Alternative: Size-based policy
     # return size_based_auto_wrap_policy(min_num_params=min_params_for_wrap)
 
@@ -381,49 +393,41 @@ if wandb_log:
         )
 
 # Helper functions for FSDP checkpointing
-def save_fsdp_model(model, optimizer, filepath, iter_num, best_val_loss, config, model_args):
-    """Save FSDP model checkpoint"""
-    if master_process:
-        print(f"Saving FSDP model checkpoint to {filepath}")
-    
-    # Save model using FSDP state_dict functionality
-    from torch.distributed.fsdp import (
-        FullStateDictConfig,
-        StateDictType,
-        FullOptimStateDictConfig,
+def save_fsdp_model(model, optimizer, filepath,
+                    iter_num, best_val_loss, config, model_args):
+    from torch.distributed.fsdp import FullStateDictConfig, StateDictType
+
+    full_cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+
+    # 1️⃣  BUILD MODEL STATE - every rank participates
+    with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, full_cfg):
+        full_model_state = model.state_dict()      # non-zero ranks get {}
+
+    # 2️⃣  BUILD OPTIMISER STATE - every rank participates
+    optim_state = FSDP.optim_state_dict(
+        model, optimizer         # returns {} on workers
     )
-    
+
+    # 3️⃣  ONLY rank-0 writes to disk
     if master_process:
-        # For saving full state dict only on master process
-        full_state_dict_config = FullStateDictConfig(
-            offload_to_cpu=True, rank0_only=True
+        torch.save(
+            {
+                "model": full_model_state,
+                "optimizer": optim_state,
+                "model_args": model_args,
+                "iter_num": iter_num,
+                "best_val_loss": best_val_loss,
+                "config": config,
+            },
+            filepath,
+            _use_new_zipfile_serialization=False,   # streams, uses less RAM
         )
-        optim_state_dict_config = FullOptimStateDictConfig(
-            offload_to_cpu=True, rank0_only=True
-        )
-        
-        with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, full_state_dict_config):
-            model_state = model.state_dict()
-            
-        with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, optim_state_dict_config):
-            optim_state = FSDP.optim_state_dict(model, optimizer)
-        
-        checkpoint = {
-            'model': model_state,
-            'optimizer': optim_state,
-            'model_args': model_args,
-            'iter_num': iter_num,
-            'best_val_loss': best_val_loss,
-            'config': config,
-        }
-        
-        torch.save(checkpoint, filepath)
-    
-    # Make sure all processes wait for master to save
+
+    # 4️⃣  Keep one global sync so everyone leaves together
     if is_distributed:
         torch.distributed.barrier()
 
-# training loop
+    # training loop
 X, Y = get_batch('train') # fetch the very first batch
 t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
@@ -436,39 +440,68 @@ while True:
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
 
-    # evaluate the loss on train/val sets and write checkpoints
-    if iter_num % eval_interval == 0 and master_process:
+    # synchronous eval on all ranks
+    if iter_num > 0 and iter_num % eval_interval == 0:
+        # 1) everyone waits here before eval starts
+        if is_distributed:
+            torch.distributed.barrier()
+
+        # 2) run eval on every rank
         losses = estimate_loss()
-        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
-        if wandb_log:
-            wandb.log({
-                "iter": iter_num,
-                "train/loss": losses['train'],
-                "val/loss": losses['val'],
-                "lr": lr,
-                "mfu": running_mfu*100, # convert to percentage
-            })
-        if losses['val'] < best_val_loss or always_save_checkpoint:
+        
+        # 3) master logs the results
+        if master_process:
+            print(f"step {iter_num}: train {losses['train']:.4f}, val {losses['val']:.4f}")
+            if wandb_log:
+                wandb.log({
+                    "iter": iter_num,
+                    "train/loss": losses['train'],
+                    "val/loss":   losses['val'],
+                    "lr": lr,
+                    "mfu": running_mfu*100,
+                })
+        
+        # 4) IMPORTANT: All ranks need to know if we're saving a checkpoint
+        do_save = (master_process and (losses['val'] < best_val_loss or always_save_checkpoint))
+        if is_distributed:
+            # Broadcast the save decision from rank 0 to all ranks
+            do_save_tensor = torch.tensor([1 if do_save else 0], device=device)
+            torch.distributed.broadcast(do_save_tensor, src=0)
+            do_save = bool(do_save_tensor.item())
+        
+        # Update best_val_loss on all ranks to keep them in sync
+        if do_save and master_process:
             best_val_loss = losses['val']
-            if iter_num > 0:
-                if is_distributed:
-                    save_fsdp_model(
-                        model, optimizer, 
-                        os.path.join(out_dir, 'ckpt.pt'),
-                        iter_num, best_val_loss, config, model_args
-                    )
-                else:
-                    # Regular checkpoint saving for non-FSDP training
-                    checkpoint = {
-                        'model': raw_model.state_dict(),
-                        'optimizer': optimizer.state_dict(),
-                        'model_args': model_args,
-                        'iter_num': iter_num,
-                        'best_val_loss': best_val_loss,
-                        'config': config,
-                    }
-                    print(f"saving checkpoint to {out_dir}")
-                    torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+        if is_distributed:
+            best_val_tensor = torch.tensor([best_val_loss], device=device)
+            torch.distributed.broadcast(best_val_tensor, src=0)
+            best_val_loss = best_val_tensor.item()
+        
+        # 5) If we're saving, ALL ranks call save_fsdp_model
+        if do_save and iter_num > 0:
+            if is_distributed:
+                save_fsdp_model(
+                    model, optimizer, 
+                    os.path.join(out_dir, 'ckpt.pt'),
+                    iter_num, best_val_loss, config, model_args
+                )
+            else:
+                # Regular checkpoint saving for non-FSDP training
+                checkpoint = {
+                    'model': raw_model.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'model_args': model_args,
+                    'iter_num': iter_num,
+                    'best_val_loss': best_val_loss,
+                    'config': config,
+                }
+                print(f"saving checkpoint to {out_dir}")
+                torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+        
+        # 6) Final barrier to ensure everyone is back in sync
+        #if is_distributed:
+        #    torch.distributed.barrier()
+
     if iter_num == 0 and eval_only:
         break
 
